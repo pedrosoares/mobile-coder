@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Secrets and local settings
+.env
+local.properties
+
+# Android build output
+.gradle/
+**/build/
+*.apk
+*.keystore
+
+# Native libraries: cargo-ndk output plus the third-party binaries that
+# tools/fetch-proot.sh downloads. Rebuilt and refetched, never committed.
+apps/android/AndroidApp/app/src/main/jniLibs/
+tools/exec-probe/AndroidApp/app/src/main/jniLibs/
+
+# Probe assets are downloaded, not committed (tools/exec-probe/fetch-assets.sh)
+tools/exec-probe/AndroidApp/app/src/main/assets/*.tar
+tools/exec-probe/AndroidApp/app/src/main/assets/MANIFEST.txt

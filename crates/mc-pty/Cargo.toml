@@ -1,0 +1,11 @@
+[package]
+name = "mc-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mc-core = { workspace = true }
+portable-pty = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

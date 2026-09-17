@@ -1,0 +1,30 @@
+[package]
+name = "android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "mobile_coder"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mobile_coder_desktop"
+path = "src/main.rs"
+
+[dependencies]
+mc-core = { workspace = true }
+mc-sandbox = { workspace = true }
+mc-agent = { workspace = true }
+mc-ui = { workspace = true }
+freya = { workspace = true, features = ["winit", "gpu"] }
+freya-winit = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+jni = "0.22"
+winit = { version = "0.30", features = ["android-native-activity", "rwh_06"] }

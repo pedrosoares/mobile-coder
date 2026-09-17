@@ -1,0 +1,23 @@
+[package]
+name = "exec-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "exec_probe"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The probe exercises the real sandbox code, not a copy of it. If mc-sandbox's
+# proot invocation regresses, this catches it on-device.
+mc-sandbox = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tar = "0.4"
+log = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+android_logger = "0.15"

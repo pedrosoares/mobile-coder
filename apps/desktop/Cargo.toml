@@ -1,0 +1,16 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mc-core = { workspace = true }
+mc-sandbox = { workspace = true }
+mc-agent = { workspace = true }
+mc-ui = { workspace = true }
+freya = { workspace = true, features = ["winit", "gpu"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/mc-core",
+  "crates/mc-sandbox",
+  "crates/mc-pty",
+  "crates/mc-agent",
+  "crates/mc-ui",
+  "apps/desktop",
+  "apps/android",
+  "tools/exec-probe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/pedrosoares/mobile-coder"
+
+[workspace.dependencies]
+mc-core    = { path = "crates/mc-core" }
+mc-sandbox = { path = "crates/mc-sandbox" }
+mc-pty     = { path = "crates/mc-pty" }
+mc-agent   = { path = "crates/mc-agent" }
+mc-ui      = { path = "crates/mc-ui" }
+
+# Freya 0.5 is the first line with Android support; 0.4.3 stable has none.
+freya       = { version = "0.5.0-rc.6", default-features = false }
+freya-winit = { version = "0.5.0-rc.6" }
+
+tokio          = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time"] }
+futures-util   = "0.3"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+thiserror      = "2"
+tracing        = "0.1"
+uuid           = { version = "1", features = ["v4", "serde"] }
+portable-pty   = "0.9"
+# rustls, not native-tls: cross-compiling OpenSSL to Android is a needless fight.
+reqwest        = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "http2", "charset"] }
+eventsource-stream = "0.2"
+log            = "0.4"
+
+[patch.crates-io]
+# Android support for freya-terminal's PTY layer. See the patch's README.
+teletypewriter = { path = "patches/teletypewriter" }
+rio-vt = { path = "patches/rio-vt" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

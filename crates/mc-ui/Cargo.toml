@@ -1,0 +1,21 @@
+[package]
+name = "mc-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mc-core = { workspace = true }
+tokio = { workspace = true }
+async-io = "2"
+# Markdown for replies; see src/markdown.rs for why not freya's own feature.
+pulldown-cmark = { version = "0.13", default-features = false }
+freya = { workspace = true, features = [
+  "winit",
+  "gpu",
+  "code-editor",
+  "terminal",
+  "terminal-pty",
+  "icons",
+  "icons-lucide",
+] }

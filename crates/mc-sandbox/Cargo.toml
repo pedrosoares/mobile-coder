@@ -1,0 +1,16 @@
+[package]
+name = "mc-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mc-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
