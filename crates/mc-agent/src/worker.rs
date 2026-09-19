@@ -5,7 +5,9 @@
 //! a time on a dedicated thread with its own tokio runtime, which keeps the agent
 //! off the UI thread and independent of whichever async runtime the UI uses.
 
-use mc_core::{AgentHandle, Event, EventBus, Project, Session};
+use std::path::PathBuf;
+
+use mc_core::{AgentCommand, AgentHandle, Event, EventBus, Project, Session, SessionLibrary};
 use mc_sandbox::Sandbox;
 
 use crate::{Agent, AgentConfig, AgentError};
@@ -19,8 +21,32 @@ use crate::{Agent, AgentConfig, AgentError};
 pub type Setup = Box<dyn Fn() -> Result<(AgentConfig, Sandbox), String> + Send>;
 
 /// Start the worker, returning the handle the UI drives it with.
+///
+/// `library` keeps the conversations across restarts: the most recent one is
+/// opened at startup and whichever is current is written after every turn, so a
+/// phone app being killed costs at most the turn in flight.
+pub fn spawn_with_library(
+    bus: EventBus,
+    project: Project,
+    setup: Setup,
+    library: Option<PathBuf>,
+) -> AgentHandle {
+    spawn_inner(bus, project, setup, library.map(SessionLibrary::new))
+}
+
+/// Start the worker without persistence.
 pub fn spawn(bus: EventBus, project: Project, setup: Setup) -> AgentHandle {
+    spawn_inner(bus, project, setup, None)
+}
+
+fn spawn_inner(
+    bus: EventBus,
+    project: Project,
+    setup: Setup,
+    library: Option<SessionLibrary>,
+) -> AgentHandle {
     let (handle, mut prompts) = AgentHandle::new(bus.clone());
+    let handle_cancel = handle.cancel_token();
 
     std::thread::Builder::new()
         .name("mc-agent-worker".into())
@@ -37,9 +63,57 @@ pub fn spawn(bus: EventBus, project: Project, setup: Setup) -> AgentHandle {
                 }
             };
 
-            let mut session = Session::new(project);
+            // Continue yesterday's conversation when there is one, so the
+            // agent keeps the context it built up about the project.
+            let mut session = match library.as_ref().and_then(SessionLibrary::most_recent) {
+                Some(restored) => {
+                    tracing::info!(turns = restored.transcript.len(), "resumed session");
+                    restored
+                }
+                None => Session::new(project.clone()),
+            };
+            let cancel = handle_cancel;
             runtime.block_on(async move {
-                while let Some(prompt) = prompts.recv().await {
+                while let Some(command) = prompts.recv().await {
+                    let prompt = match command {
+                        AgentCommand::Prompt(prompt) => prompt,
+
+                        // Switching chats saves the one being left, because the
+                        // in-memory transcript is ahead of the file whenever a
+                        // turn ended in something unsaved - a cancellation, say.
+                        AgentCommand::Open(id) => {
+                            save(&library, &session);
+                            match library.as_ref().and_then(|library| library.load(id)) {
+                                Some(opened) => session = opened,
+                                None => {
+                                    tracing::warn!(%id, "no such chat; starting an empty one");
+                                    session = Session::new(project.clone());
+                                }
+                            }
+                            // Written again on the way in, so that "most
+                            // recent" means the chat last *opened* rather than
+                            // the one last left - otherwise switching away from
+                            // a chat makes the one you left the one that
+                            // reopens at launch.
+                            save(&library, &session);
+                            bus.emit(Event::SessionOpened { session: session.id });
+                            continue;
+                        }
+
+                        AgentCommand::NewChat => {
+                            save(&library, &session);
+                            session = Session::new(project.clone());
+                            // Saved immediately, so an empty chat the user made
+                            // on purpose survives the app being killed before
+                            // they type anything into it.
+                            save(&library, &session);
+                            bus.emit(Event::SessionOpened { session: session.id });
+                            continue;
+                        }
+                    };
+
+                    // A stop pressed while idle must not kill the next turn.
+                    cancel.reset();
                     let (config, sandbox) = match setup() {
                         Ok(parts) => parts,
                         Err(reason) => {
@@ -52,7 +126,7 @@ pub fn spawn(bus: EventBus, project: Project, setup: Setup) -> AgentHandle {
                     };
 
                     let agent = Agent::new(config, sandbox, bus.clone());
-                    match agent.run_turn(&mut session, &prompt).await {
+                    match agent.run_turn_cancellable(&mut session, &prompt, &cancel).await {
                         Ok(()) => {}
                         // run_turn already reported a refusal.
                         Err(AgentError::Refused(_)) => {}
@@ -61,12 +135,29 @@ pub fn spawn(bus: EventBus, project: Project, setup: Setup) -> AgentHandle {
                             message: describe(&e),
                         }),
                     }
+
+                    // Save whatever the turn produced, successful or not: a
+                    // failed turn still moved the conversation along.
+                    save(&library, &session);
                 }
             });
         })
         .expect("failed to spawn the agent worker thread");
 
     handle
+}
+
+/// Write the session, if there is anywhere to write it.
+///
+/// A failure is logged and swallowed: the conversation is still in memory and
+/// still usable, and stopping a turn because a write failed would turn a full
+/// disk into a broken app.
+fn save(library: &Option<SessionLibrary>, session: &Session) {
+    if let Some(library) = library
+        && let Err(e) = library.save(session)
+    {
+        tracing::error!(%e, "could not save the session");
+    }
 }
 
 /// Turn an agent error into something a person can act on.

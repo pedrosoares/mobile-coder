@@ -34,6 +34,33 @@ pub fn is_busy() -> bool {
     BUSY.load(Ordering::Relaxed)
 }
 
+/// What is running, in one line, or empty when nothing is.
+///
+/// The shell polls this to decide whether the app must be kept out of Android's
+/// freezer, and what to put in the notification while it is. Both answers come
+/// from the same place so they cannot disagree - a notification saying "1
+/// background job" while nothing runs would be worse than no notification.
+pub fn work_summary() -> String {
+    let jobs = mc_core::jobs::running();
+    let turn = is_busy();
+    let mut parts = Vec::new();
+    if turn {
+        parts.push("Working on a turn".to_string());
+    }
+    match jobs {
+        0 => {}
+        1 => parts.push("1 background job".into()),
+        n => parts.push(format!("{n} background jobs")),
+    }
+    // A server the user started by hand in the Terminal is not in this list,
+    // and cannot be: detecting it would mean reading `/proc/net/tcp` for a
+    // listening socket, and this app is not allowed to
+    // (measured on the Fold6: "Permission denied", from the app's own process).
+    // That case is what the keep-awake switch in settings is for. A server the
+    // *agent* starts is a background job, and counted above.
+    parts.join(" · ")
+}
+
 /// Called by the bootstrap once the guest is proven to run commands.
 pub fn mark_ready(native_lib_dir: PathBuf, rootfs: PathBuf) {
     // Write DNS before announcing readiness, so the first agent turn can resolve.
@@ -46,12 +73,25 @@ pub fn sandbox_paths() -> Option<&'static (PathBuf, PathBuf)> {
     SANDBOX_PATHS.get()
 }
 
+/// Where the conversations are kept, beside the rootfs: one file per chat.
+pub const SESSIONS_DIR: &str = "sessions";
+/// The single file used before chats were plural. Adopted into the directory on
+/// first launch and then gone.
+pub const LEGACY_SESSION_FILE: &str = "session.json";
+
+/// The chat library for this device.
+pub fn library(files_dir: &std::path::Path) -> mc_core::SessionLibrary {
+    let library = mc_core::SessionLibrary::new(files_dir.join(SESSIONS_DIR));
+    library.adopt(&files_dir.join(LEGACY_SESSION_FILE));
+    library
+}
+
 /// Start the worker and return the handle the UI drives it with.
-pub fn start() -> AgentHandle {
+pub fn start(files_dir: PathBuf) -> AgentHandle {
     let bus = EventBus::default();
     mirror_to_logcat(&bus);
 
-    let handle = worker::spawn(
+    let handle = worker::spawn_with_library(
         bus,
         Project { name: "root".into(), path: PathBuf::from("/root") },
         Box::new(|| {
@@ -77,6 +117,7 @@ pub fn start() -> AgentHandle {
             log::info!("[turn] endpoint {} model={}", config.base_url, config.model);
             Ok((config, sandbox))
         }),
+        Some(files_dir.join(SESSIONS_DIR)),
     );
 
     if let Ok(mut slot) = HANDLE.lock() {
@@ -114,6 +155,26 @@ impl DeviceFiles {
     }
 }
 
+/// A sandbox for whoever needs one outside a turn - the Git pane, running git
+/// in the guest where the working tree is.
+#[derive(Debug)]
+pub struct DeviceSandbox;
+
+impl mc_sandbox::SandboxFactory for DeviceSandbox {
+    fn create(&self) -> Result<Sandbox, String> {
+        let (lib_dir, rootfs) = SANDBOX_PATHS
+            .get()
+            .ok_or("The Linux environment is still installing. Try again in a moment.")?;
+        let tmp_dir = rootfs
+            .parent()
+            .map(|files| files.join("proot-tmp"))
+            .unwrap_or_else(|| rootfs.join("tmp"));
+        Ok(Sandbox::new(Box::new(
+            ProotBackend::from_native_lib_dir(lib_dir, rootfs).with_tmp_dir(tmp_dir),
+        )))
+    }
+}
+
 /// Shell for the Terminal pane: an interactive login shell under proot, with the
 /// exact setup the agent's tool calls use.
 pub struct DeviceShell;
@@ -132,6 +193,13 @@ impl mc_core::ShellLauncher for DeviceShell {
             .interactive()
             .map(Into::into)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Stop the turn that is running, if any.
+pub fn stop_turn() {
+    if let Some(handle) = HANDLE.lock().ok().and_then(|slot| slot.clone()) {
+        handle.stop();
     }
 }
 
@@ -236,6 +304,15 @@ mod jni_bridge {
         outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>();
     }
 
+    /// `MainActivity.nativeStopTurn`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeStopTurn<'caller>(
+        _unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) {
+        super::stop_turn();
+    }
+
     /// `MainActivity.nativeIsBusy`.
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeIsBusy<'caller>(
@@ -243,6 +320,119 @@ mod jni_bridge {
         _class: JClass<'caller>,
     ) -> jni::sys::jboolean {
         super::is_busy()
+    }
+
+    /// `MainActivity.nativeTakeSettingsRequest`: true once, after the user taps
+    /// the settings button in the app bar.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeTakeSettingsRequest<'caller>(
+        _unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) -> jni::sys::jboolean {
+        mc_ui::safe_area::take_settings_request()
+    }
+
+    /// `MainActivity.nativeTakeClipboard`: text the app wants copied, or "".
+    ///
+    /// Pulled by the UI thread rather than pushed from Rust: `ClipboardManager`
+    /// is only usable from the thread that owns the Activity, and Freya's
+    /// render thread is not it.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeTakeClipboard<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) -> jni::sys::jstring {
+        // The local reference travels back to Java as an address: `resolve`
+        // needs a `Default` type to fall back to on error, and a raw pointer
+        // has none - 0 is the null JNI returns for "nothing to copy".
+        let reference = unowned_env
+            .with_env(|env| -> Result<usize, jni::errors::Error> {
+                let text = mc_ui::clipboard::take_pending().unwrap_or_default();
+                Ok(env.new_string(text)?.into_raw() as usize)
+            })
+            .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+        reference as jni::sys::jstring
+    }
+
+    /// `MainActivity.nativeTakePromptRequest`: which field the Git pane wants,
+    /// or 0 for none.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeTakePromptRequest<'caller>(
+        _unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) -> jni::sys::jint {
+        mc_ui::prompt::take_request().map(|p| p as jni::sys::jint).unwrap_or(0)
+    }
+
+    /// `MainActivity.nativePromptSpec`: how to label the dialog, NUL-separated
+    /// as `title\0hint\0secret\0multiline`.
+    ///
+    /// The wording lives with the screen that asks for it rather than being
+    /// duplicated in Kotlin, where it would drift.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativePromptSpec<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        kind: jni::sys::jint,
+    ) -> jni::sys::jstring {
+        let spec = match mc_ui::prompt::Prompt::from_code(kind as u8) {
+            Some(prompt) => format!(
+                "{}\0{}\0{}\0{}",
+                prompt.title(),
+                prompt.hint(),
+                u8::from(prompt.is_secret()),
+                u8::from(matches!(prompt, mc_ui::prompt::Prompt::CommitMessage)),
+            ),
+            None => String::new(),
+        };
+        let reference = unowned_env
+            .with_env(|env| -> Result<usize, jni::errors::Error> {
+                Ok(env.new_string(spec)?.into_raw() as usize)
+            })
+            .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+        reference as jni::sys::jstring
+    }
+
+    /// `MainActivity.nativeAnswerPrompt`: what the user typed.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeAnswerPrompt<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        kind: jni::sys::jint,
+        text: JString<'caller>,
+    ) {
+        let outcome = unowned_env.with_env(|env| -> Result<(), jni::errors::Error> {
+            if let Some(prompt) = mc_ui::prompt::Prompt::from_code(kind as u8) {
+                mc_ui::prompt::answer(prompt, text.try_to_string(env)?);
+            }
+            Ok(())
+        });
+        outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+    }
+
+    /// `MainActivity.nativeTakeGithubForget`: true once, after a sign-out, so
+    /// the sealed copy on disk goes too.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeTakeGithubForget<'caller>(
+        _unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) -> jni::sys::jboolean {
+        mc_ui::git::take_forget_request()
+    }
+
+    /// `MainActivity.nativeWorkSummary`: what is running, or "" for nothing.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeWorkSummary<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) -> jni::sys::jstring {
+        let summary = super::work_summary();
+        let reference = unowned_env
+            .with_env(|env| -> Result<usize, jni::errors::Error> {
+                Ok(env.new_string(summary)?.into_raw() as usize)
+            })
+            .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+        reference as jni::sys::jstring
     }
 
     /// `MainActivity.nativeComposerMode`: 0 hidden, 1 chat, 2 terminal.

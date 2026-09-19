@@ -19,6 +19,9 @@ mc-core = { workspace = true }
 mc-sandbox = { workspace = true }
 mc-agent = { workspace = true }
 mc-ui = { workspace = true }
+mc-github = { workspace = true }
+# Only for getuid, to tell this app's listening sockets from anyone else's.
+libc = "0.2"
 freya = { workspace = true, features = ["winit", "gpu"] }
 freya-winit = { workspace = true }
 log = { workspace = true }

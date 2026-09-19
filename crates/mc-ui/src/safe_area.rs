@@ -9,7 +9,7 @@
 //! Stored in atomics because the values arrive on the Android UI thread while
 //! Freya renders on its own; desktop never sets them and gets zeros.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 static TOP: AtomicU32 = AtomicU32::new(0);
 static BOTTOM: AtomicU32 = AtomicU32::new(0);
@@ -34,6 +34,22 @@ static COMPOSER_MODE: AtomicU8 = AtomicU8::new(ComposerMode::Chat as u8);
 
 pub fn set_composer_mode(mode: ComposerMode) {
     COMPOSER_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// Set when the user asks for settings, cleared once the shell has opened them.
+///
+/// The settings form has to be native for the same reason the message box is:
+/// Freya receives no on-screen keyboard text on Android. The UI cannot open an
+/// Android dialog itself, so it raises a flag the shell polls.
+static SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub fn request_settings() {
+    SETTINGS_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Take the pending request, if any.
+pub fn take_settings_request() -> bool {
+    SETTINGS_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
 pub fn composer_mode() -> ComposerMode {

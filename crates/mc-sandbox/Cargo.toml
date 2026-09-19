@@ -14,3 +14,8 @@ futures-util = { workspace = true }
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Only for killpg: a deadline has to reach the whole process group, and neither
+# std nor tokio exposes that.
+libc = "0.2"

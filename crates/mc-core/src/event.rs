@@ -45,6 +45,22 @@ pub enum Event {
         attempt: u32,
         reason: String,
     },
+    /// How much of the model's context the last request used, as the API
+    /// counted it. Emitted per response, so the meter moves as tool output
+    /// piles up within a single turn rather than only between turns.
+    ContextUsage {
+        session: SessionId,
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    /// Older turns were summarized and dropped to stay inside the context.
+    /// Worth telling the user: the model no longer has those messages verbatim.
+    Compacted { session: SessionId, dropped: usize },
+    /// A different chat is now the current one - opened, or newly made. The UI
+    /// rebuilds its transcript from the library rather than being sent it:
+    /// a whole conversation through a broadcast channel, to every subscriber,
+    /// for something that happens on a tap, is a waste.
+    SessionOpened { session: SessionId },
     /// The turn ended. `stop_reason` is the API's, verbatim.
     TurnEnded {
         session: SessionId,

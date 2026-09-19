@@ -38,9 +38,16 @@ pub fn run(files_dir: PathBuf) {
         }
     };
 
+    // Set when this launch actually installed the rootfs, so the one-time
+    // package setup below runs on a fresh guest and not on every start.
+    let fresh = std::sync::atomic::AtomicBool::new(true);
+
     let installed = runtime.block_on(mc_sandbox::rootfs::ensure(&spec, &|progress| {
         match progress {
-            Progress::AlreadyReady => log::info!("rootfs already installed"),
+            Progress::AlreadyReady => {
+                fresh.store(false, std::sync::atomic::Ordering::Relaxed);
+                log::info!("rootfs already installed")
+            }
             // Only log at boundaries - a per-chunk log would flood logcat and
             // slow the download it is reporting on.
             Progress::Downloading { downloaded, total } => match total {
@@ -83,6 +90,43 @@ pub fn run(files_dir: PathBuf) {
                 out.stderr.trim()
             ),
             Err(e) => log::error!("[guest] {command} could not run: {e}"),
+        }
+    }
+
+    // git is not in the minirootfs, and both the agent's local git tools and
+    // any cloned project need it. Best effort: a failure here (no network on
+    // first launch, say) leaves a working sandbox without git, and `apk add
+    // git` from the terminal fixes it later.
+    //
+    // DNS first. `mark_ready` writes the guest's resolv.conf, and it runs after
+    // this block - without this call a fresh rootfs has no nameserver, and apk
+    // would fail to resolve the mirror.
+    crate::network::apply(&rootfs);
+
+    if guest_ok {
+        // Every launch, not only a fresh rootfs: a guest installed before this
+        // was known has a broken git until it is set, and the user's own
+        // commands in the Terminal need it as much as the app's do.
+        //
+        // Android forbids hard links, so proot emulates them - and the
+        // emulation puts a loose object somewhere git cannot find it again,
+        // leaving `refs/heads/main` pointing at a commit that does not exist.
+        // `rename` is git's own answer for filesystems like this one.
+        match runtime.block_on(
+            sandbox.run("git config --global core.createObject rename", None),
+        ) {
+            Ok(out) if out.ok() => log::info!("git configured for a filesystem without hard links"),
+            Ok(out) => log::warn!("could not configure git: {}", out.stderr.trim()),
+            Err(e) => log::warn!("could not configure git: {e}"),
+        }
+    }
+
+    if guest_ok && fresh.load(std::sync::atomic::Ordering::Relaxed) {
+        log::info!("installing git into the new guest");
+        match runtime.block_on(sandbox.run("apk add --no-progress git", None)) {
+            Ok(out) if out.ok() => log::info!("git installed"),
+            Ok(out) => log::warn!("could not install git: {}", out.stderr.trim()),
+            Err(e) => log::warn!("could not install git: {e}"),
         }
     }
 

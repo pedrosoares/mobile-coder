@@ -6,6 +6,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Android freezes a cached app's processes, and the sandbox is part of
+         this app: a server started in it would stop answering the moment the
+         app left the screen. A foreground service is what keeps it running.
+         The notification needs no permission to exist, but does to be seen. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:hasCode="true"
         android:label="mobile-coder"
@@ -31,5 +39,17 @@
                 android:name="android.app.lib_name"
                 android:value="mobile_coder" />
         </activity>
+
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <!-- None of the defined types fit: this is not data sync, media or
+                 location, it is the user's own processes - a build, a server, a
+                 watcher - that they started and expect to keep running. -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the user's own sandbox processes running while the app is in the background" />
+        </service>
     </application>
 </manifest>

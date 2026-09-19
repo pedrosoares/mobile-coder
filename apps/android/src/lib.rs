@@ -50,7 +50,16 @@ fn android_main(droid_app: winit::platform::android::activity::AndroidApp) {
     // focused node has an IME accessibility role.
     // Start the worker before the window, so the chat has a handle on first
     // render. It answers "still installing" until the bootstrap finishes.
-    let agent = agent_task::start();
+    let files_dir = droid_app
+        .internal_data_path()
+        .unwrap_or_else(|| std::path::PathBuf::from("/data/local/tmp"));
+    let agent = agent_task::start(files_dir.clone());
+
+    // The conversation as the user left it, rebuilt from the saved transcript.
+    let sessions = std::sync::Arc::new(agent_task::library(&files_dir));
+    let restored = sessions
+        .most_recent()
+        .map(|session| mc_core::ChatLog::from_session(&session));
 
     let mut config = LaunchConfig::new();
     match mc_ui::markdown::android_mono_font() {
@@ -68,6 +77,9 @@ fn android_main(droid_app: winit::platform::android::activity::AndroidApp) {
                 native_composer: true,
                 files: Some(std::sync::Arc::new(agent_task::DeviceFiles)),
                 shell: Some(std::sync::Arc::new(agent_task::DeviceShell)),
+                sandbox: Some(std::sync::Arc::new(agent_task::DeviceSandbox)),
+                sessions: Some(sessions),
+                restored,
             }))
             .with_event_loop(event_loop),
     )

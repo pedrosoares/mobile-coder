@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 mc-core = { workspace = true }
+# The Git pane runs git in the sandbox and talks to GitHub; both are the pane's
+# subject, not an incidental dependency.
+mc-sandbox = { workspace = true }
+mc-github = { workspace = true }
+log = { workspace = true }
 tokio = { workspace = true }
 async-io = "2"
 # Markdown for replies; see src/markdown.rs for why not freya's own feature.

@@ -350,7 +350,9 @@ Start deliberately small. Every tool is a typed call into `mc-sandbox`:
 
 | Tool | Notes |
 |---|---|
-| `bash` | Runs inside proot/Alpine, captured output, timeout, cwd-scoped |
+| `bash` | Runs inside proot/Alpine, captured output, timeout, cwd-scoped; `run_in_background` starts a job instead |
+| `job_output` | What a job printed since the last read, or the list of jobs |
+| `job_kill` | Ends a job and everything it started |
 | `read_file` | Offset/limit, so a large file can't blow the context |
 | `write_file` | Whole-file write |
 | `edit_file` | Exact string replacement — cheaper and safer than rewrites |
@@ -359,6 +361,24 @@ Start deliberately small. Every tool is a typed call into `mc-sandbox`:
 `bash` alone would technically be sufficient, and it is tempting on a small screen. Resist it:
 dedicated file tools produce structured, reviewable diffs, which is what makes an
 approval UI possible at all on a phone.
+
+**Jobs.** A tool call blocks its turn, which is right for a build and wrong for a dev server. A
+`bash` call with `run_in_background` returns a job id at once and keeps running between turns, with
+no deadline — so everything around it is built for seeing and ending it: `job_output` (new output
+since the last read, or the whole list when called with no id), `job_kill` (`"all"` included), a
+per-job output buffer capped at 256 KB keeping the *tail*, and a count in the chat's status line,
+because a process running with nothing on screen to say so is how a phone ends up warm in a pocket.
+A job is not a way around the command deadline; it is for the commands a deadline makes no sense
+for.
+
+The registry is process-wide rather than per-`Sandbox`, since a `Sandbox` is rebuilt every turn and
+a job is meant to outlive exactly that. It does not outlive the *app*, and nothing has to make sure
+of that: Android tears down the app's process group when the app process goes, and the guest goes
+with it (measured on the Fold6 — gone after `am force-stop`, gone after a bare `kill -9` of the app
+process, proot and the shell under it included). The obvious belt-and-braces, sweeping `/proc` at
+startup for anything still running out of this rootfs, is not available to an app at all: `/proc` is
+mounted with `hidepid`, and from inside the app the sweep saw exactly one process — itself. A
+`run-as` shell sees a thousand, which is what makes this easy to get wrong from a terminal.
 
 ---
 
@@ -452,7 +472,7 @@ they are.
 
 ---
 
-## 9. GitHub integration (planned)
+## 9. GitHub integration
 
 **Goal:** clone, commit, push and pull from the phone, with GitHub as the place code lives.
 
@@ -460,7 +480,8 @@ they are.
 *now*, not an archive. With a reliable push, a finished project can be removed from the device and
 cloned back when needed. Without it, every project is stuck using storage indefinitely.
 
-Nothing in this section is built yet. The facts it relies on were checked on 2026-09-17.
+**Built on 2026-09-18**, in `crates/mc-github` and the Git pane, with one decision reversed: see
+§9.2. The facts below were checked on 2026-09-17 and still hold.
 
 ### 9.1 What was checked
 
@@ -475,16 +496,42 @@ Nothing in this section is built yet. The facts it relies on were checked on 202
 - **GitHub's OAuth device flow** needs only a `client_id` (no client secret, so it is safe to ship in
   an app). It must be enabled in the app's settings, and the user code expires after 15 minutes.
 
-### 9.2 Decision: git runs in the app process, not inside the sandbox
+### 9.2 Decision: git runs in the sandbox, the token does not
+
+> **Superseded, 2026-09-18.** The original decision - reproduced below, because its reasoning still
+> governs everything here - was to link libgit2 into the app so git itself ran outside the sandbox.
+> What was built instead keeps the *property* that mattered and drops the mechanism. The threat is
+> unchanged: any token reachable from the guest is reachable by a model following instructions it
+> read in a cloned repository. The question is only how to authenticate without putting it there.
+>
+> **The proxy.** `git` runs in the sandbox, where the working tree is. For an operation that needs
+> credentials, the app opens a loopback HTTP server, and git is pointed at it with
+> `-c url.http://127.0.0.1:<port>/<secret>/.insteadOf=https://github.com/`. Every request is
+> forwarded to GitHub over HTTPS with an `Authorization` header added on the way past. The guest
+> sees an address and a random path; the token stays in this process.
+>
+> Scope and lifetime do the rest: one proxy serves **one repository**, checked on every request, and
+> lives only for the length of one clone, pull or push. A path that leaks is a path to a repository
+> the user just chose to publish to, and it stops working seconds later.
+>
+> `-c` rather than a remote URL, so nothing is written to `.git/config`: the remote on disk stays the
+> real `https://github.com/...` URL, which is what a person expects to see and what works from a
+> desktop. A test asserts exactly that after a real clone.
+>
+> **What this buys:** no C toolchain, no OpenSSL cross-compile, no custom smart-HTTP transport - and
+> the guest's own `git` 2.47, with shallow clone and everything else, instead of libgit2's subset.
+> **What it costs:** while an operation runs, a process in the sandbox could use the proxy to reach
+> that one repository. Bounded, deliberate, and written down here rather than discovered later.
+
+#### The original reasoning, which still applies
 
 Running `git` inside Alpine is the obvious choice and the wrong one. Everything in the guest shares
 one sandbox with the agent's `bash` tool. Any token `git` can read there, a command the model runs
 can read too, and a prompt injection in a cloned repository's files could send it out.
 
-So user-facing git operations run **in the app process**, in a new `mc-git` crate on top of `git2`.
-It works on the rootfs through the host path, using the same guest-to-host mapping as
-`mc_sandbox::fs::RootedFs`. The token then lives only in app memory, never in a file or a process
-environment the guest can see.
+So the token lives only in app memory, never in a file, a command line, a remote URL or a process
+environment the guest can see. (The original plan reached that by running git in the app process on
+top of `git2`; the proxy above reaches it another way.)
 
 **How far that isolation goes is not yet proven.** A first draft of this section claimed Android's
 Yama ptrace policy keeps guest processes out of the app's memory. Measured on the API 36 emulator,
@@ -521,6 +568,11 @@ Two rules follow from this, and they are easy to break by accident:
 
 ### 9.4 Operations
 
+All of these are in the **Git pane**, which is a screen rather than a settings page because on a
+phone the repository *is* the storage story: a project that is pushed can be deleted and cloned back,
+and one that is not is on the device forever. So it shows the state of the work - branch, changes,
+ahead and behind - alongside the account.
+
 | Operation | Behaviour |
 |---|---|
 | **Clone** | HTTPS, **shallow (depth 1) by default**, into `/root/projects/<name>`. Full history on request. |
@@ -550,7 +602,48 @@ talks to GitHub stays a user action.
 Limits to be upfront about: libgit2 has no partial clone or sparse checkout, so a large monorepo is
 still large, and Git LFS is not supported.
 
-### 9.6 Build order
+### 9.6 Git cannot write objects here without being told
+
+Git writes a loose object by writing a temporary file, `link()`ing it into place and unlinking the
+temporary. Android forbids hard links, so proot emulates `link()` (`--link2symlink`, §2.2) by leaving
+a chain of symlinks and `.l2s.tmp_obj_…` files behind. Git's object then is not a file git can read
+back reliably, and the failure is silent until something needs the object:
+
+```
+$ git rev-parse HEAD          # fine: that only reads the ref
+0a860c20915e27b12eeb9d5260f29b75014e0307
+$ git status
+fatal: bad object HEAD        # the commit the ref points at cannot be read
+```
+
+Measured on the Fold6: after a commit, `.git/objects/0a/` held the "object" as a symlink to a symlink
+to `.l2s.tmp_obj_kcc9We0001.0001`, the ref pointed at a commit nothing could read, and every later
+git command in that repository failed. A push then aborts before it starts, because the status read
+that precedes it is the thing that fails.
+
+`core.createObject=rename` is git's own switch for filesystems without working hard links, and it
+makes git use `rename()` instead. It is set two ways, because one is not enough:
+
+- **globally in the guest, on every launch** (`git config --global core.createObject rename`), so the
+  user's own commands in the Terminal and the agent's `bash` are covered too - not just a fresh
+  rootfs, because a guest installed before this was known has a broken git until it is set;
+- **on every git command this app runs** (`-c core.createObject=rename`), so it holds even where the
+  global config does not apply.
+
+With it, a commit produces an ordinary object file and no symlinks at all.
+
+### 9.7 What is built, and what is not
+
+Built: the token (entered in a native dialog, sealed by `KeyVault`, never logged un-redacted, and
+deleted from the device the moment GitHub rejects it), the account, the repository list, **create
+repository** (private, with a first commit, then cloned), **clone** (shallow by default), **status**,
+**commit** and **push**, and **pull** as fetch plus fast-forward only.
+
+Not built, and deliberately: the device flow (§9.3, needs a registered app), the storage features of
+§9.5 (sizes, cleaning build artifacts, offload), and agent-facing git tools. The agent can already
+run local git through `bash`; nothing gives it the network path, and push stays a user action.
+
+### 9.8 Original build order
 
 1. **Spike: `git2` on Android with HTTPS**, the same way `tools/exec-probe` settled proot. Build with
    `vendored-openssl`, then clone and push a throwaway repository from the phone. In the same spike,
@@ -570,7 +663,7 @@ still large, and Git LFS is not supported.
    proposes.
 6. **Device flow**, once a GitHub App is registered.
 
-### 9.7 Open decisions
+### 9.9 Open decisions
 
 - **Token first, or register a GitHub App now for the device flow?** The token is faster to ship;
   the App gives a better login and expiring credentials.
@@ -579,3 +672,199 @@ still large, and Git LFS is not supported.
   the token is acceptable in-process anyway (scoped to a few repositories, short-lived), or needs
   stronger separation, such as git in a separate Android service process with its own lifecycle.
 
+
+---
+
+## 10. Many chats, one agent
+
+A coding session is not one long thread. A bug fix, a dependency upgrade and a question about a file
+have nothing to do with each other, and keeping them in one transcript costs money on every later
+turn — it is all re-sent — and makes the model worse at each of them. So chats are separate.
+
+**The directory is the index.** One JSON file per chat, named by its id, under `sessions/` beside the
+rootfs (`.mobile-coder-chats/` in the desktop workspace). Listing reads the files; there is no
+catalogue to fall out of step with them, so a chat that exists is always listed and a deleted one
+never is. That costs a parse per chat when the picker opens, which for a few dozen chats on a phone
+is nothing.
+
+**Titles are derived, not asked for.** The first thing the user said, clipped to a list row. Nobody
+names a conversation before having it. A title someone sets explicitly is kept; the two placeholder
+titles (including the one sessions written before this carried) are treated as unset.
+
+**One channel to the worker.** `AgentCommand` is `Prompt`, `Open(id)` or `NewChat`, all through the
+queue the prompts already used, so the order is the order things were pressed in: a prompt sent just
+before a switch cannot arrive after it and land in the wrong transcript. The worker saves the chat it
+is leaving (the in-memory transcript is ahead of the file whenever a turn ended in a cancellation),
+loads the new one, and saves that too — so "most recent" means the chat last *opened*, not the one
+last left, which is what makes the right chat reopen at launch.
+
+**The UI does not carry the transcript around.** The worker emits `SessionOpened { id }` and the view
+loads that chat from the library itself; a whole conversation through a broadcast channel, to every
+subscriber, for something that happens on a tap, would be waste.
+
+**Where it lives on screen:** a bar above the transcript, not a fifth tab. The tab row is already
+four wide on a folded phone, and a chat switcher belongs inside the chat, next to what it switches.
+Switching and starting a chat are disabled mid-turn, because a reply that arrives in a chat the user
+has left is a bug report waiting to happen.
+
+---
+
+## 11. The freezer
+
+Android freezes a cached app's processes, and the sandbox is *inside* this app — so everything in it
+freezes too. Measured on the emulator: a streaming turn was 13 seconds past the home button when the
+connection died (`stream broke (transport: error decoding response body)`) and could not be
+re-established until the app was back on screen. A dev server started in the guest behaves the same
+way from the other end: it accepts the connection and never answers, and the browser sits there.
+
+This is not a bug to work around; it is the platform doing what it is supposed to. The only thing
+that changes it is a **foreground service**, which takes the process out of the cached state. So one
+runs — and only while it is earning its keep:
+
+| While | The notification says |
+|---|---|
+| a turn is running | Working on a turn |
+| background jobs are running | 2 background jobs |
+| this app has a socket in `LISTEN` | Serving |
+| the user pinned it in settings | Keeping the sandbox awake |
+
+The third row is the one that matters for a server, and it needs no setting: the app cannot see that
+`python -m http.server` is a server and `vi` is not, but it can see the consequence in
+`/proc/net/tcp`. Since Android 10 that table is filtered to the calling app's own sockets, and the
+sandbox shares the app's uid because proot does not change it — so what is listening there is ours.
+The uid column is checked anyway, so that a future change to that filtering cannot turn into a
+battery drain nobody can explain.
+
+The switch stays because detection has a blind spot: a process that is busy but not listening — a
+long `make` started by hand in the Terminal — looks identical to an idle shell.
+
+**The notification is the point, not a tax.** Something is running on the user's phone; they should
+be able to see it and stop it. Its Stop action turns the switch off as well as stopping the service,
+because the poll would otherwise restart it a quarter of a second later, and a Stop button that does
+nothing is worse than none.
+
+With nothing running, no service runs and the app freezes like any other — which is what should
+happen to a coding tool sitting in the background on a battery.
+
+---
+
+## 12. What "usable without a computer" required
+
+The spike answered whether a coding agent *can* run on a phone. Using one for real work needed a
+further pass, recorded here because each item exists for a reason that is easy to lose.
+
+**A turn must be interruptible.** On a phone, force-quitting the app was otherwise the only way out
+of a turn going the wrong way — and force-quitting loses the conversation. `mc_core::Cancel` (a flag
+plus a `Notify`) is checked by the stream loop and by the command runner, so Stop reaches both a
+model that is mid-sentence and a `sleep 600` that is mid-run. The turn ends with
+`stop_reason: "cancelled"`, which the chat shows as "Stopped." rather than as an error, and the
+token resets per prompt so a stop pressed while idle cannot kill the next turn.
+
+**Commands need a deadline.** `bash` takes `timeout_seconds` (default 300, ceiling 3600). A command
+that runs out of time is killed, and whatever it printed first is kept and handed back — a build that
+hangs at 95% still tells the model where it got to.
+
+**Output has to be drained while it is produced, not after.** Waiting on a child while its pipes fill
+deadlocks at the 64 KB pipe buffer: the command blocks writing, the parent blocks waiting, and the
+turn sits there until the timeout. `run_inner` spawns a reader per stream and only then waits.
+The regression test (`output_larger_than_a_pipe_buffer_does_not_deadlock`) is worth keeping.
+
+**Output also has to be capped.** 30 000 characters per tool result, keeping the head (two thirds)
+and the tail (one third) with a count of what was dropped between them. Both ends matter: a compiler
+prints its first errors at the top and its summary at the bottom.
+
+**The conversation must outlive the process.** Android kills backgrounded apps freely. `SessionStore`
+writes the transcript after every turn (write-temp-then-rename, so a kill cannot leave half a file),
+the worker resumes from it at startup, and `ChatLog::from_session` rebuilds the view — including
+marking as interrupted any tool that was running when the app died.
+
+**The model must be configurable from the phone.** Until the settings dialog existed, the key and
+endpoint could only be set over adb, which makes a computer a prerequisite for the app whose point is
+not needing one. It is a native `AlertDialog` (Freya cannot receive on-screen keyboard text in a
+`NativeActivity`), reached from the ⚙ in the app bar through a flag polled by the UI thread. The
+endpoint and model live in `SharedPreferences`; the key stays in the Keystore and is never shown
+back, only reported as present. Changes apply to the next turn — the worker builds its config per
+prompt — so there is nothing to restart.
+
+**The chat has to follow the reply without trapping the reader.** A transcript that only scrolls
+when a *message* is added stops moving while a long reply streams in, and one that scrolls on every
+change yanks the screen away from someone reading an earlier command. So the rule is the one every
+chat uses: keep to the bottom while the reader is at the bottom, and stop the moment they are not.
+Freya gives the sizes needed for that through `on_sized` on the scroll area (the viewport) and on
+the transcript itself (the content); the bottom is the difference between them, and the decision -
+`follow_target` in `mc-ui/src/chat.rs` - is a pure function of those two sizes and the current
+position, which is what makes it testable. Two details are load-bearing: it scrolls *downwards
+only*, because writing back a position the view already holds lays out again, measures again, and
+never settles; and sending a message always jumps to the bottom, since sending is a decision to
+watch the reply.
+
+**Text must be able to leave the app.** The phone is the only machine, so an answer, a command, a
+compiler error or a code block has to reach a browser, a note or someone else. Copy buttons sit on
+assistant messages, code blocks, tool cards (command and output together) and errors. On Android the
+clipboard is reached by polling from the UI thread rather than pushing from Rust, because
+`ClipboardManager` may only be touched there.
+
+**Two things the dialog taught us about the composer.** The message box is a focusable
+`PopupWindow`, and a focusable popup keeps input focus even under a dialog — typing into the settings
+form landed in the message box. It now steps aside while a dialog is open. And because the app draws
+edge to edge, the system does not resize windows for the keyboard: the dialog sits at the top of the
+screen so its buttons stay clear of it.
+
+**Two things a spawned command must not inherit.** Found on the phone, invisible
+anywhere else (see `docs/PHONE-TESTS.md`, checks 2 and 3):
+
+- *The parent's signal state.* Rust ignores SIGPIPE for the whole process, an Android app's threads
+  block several signals, and both survive `exec` — so every guest process saw `EPIPE` where it
+  expected to die, and `yes hello | head -c 2000000` never ended. Commands are now spawned through a
+  `pre_exec` that clears the mask and restores the default SIGPIPE; the PTY path needed the same
+  (`patches/teletypewriter`).
+- *A shared process group.* proot's `--kill-on-exit` kills the guest tree when the guest's first
+  process exits; it does nothing when proot itself is killed, because the tracees are simply
+  detached. A timeout therefore left the command running — and holding the pipe, so the tool never
+  returned at all. Each command now gets its own process group, which is what the deadline and the
+  Stop button kill, and the drain that follows is bounded so a survivor can never hang a turn.
+
+---
+
+## 13. Staying inside the context window
+
+Every turn re-sends the whole conversation. Left alone that ends one way: a session grows past what
+the model accepts, the request is refused, and **every later turn fails identically** — the
+transcript only gets longer. On a desktop you would edit the history or start again; on a phone,
+with the session restored from disk at every launch, there is no way out at all. So this is not an
+optimisation, it is the difference between a session that ends and one that can be used for a day.
+
+**What is dropped, and what replaces it.** Compaction drops a *prefix* of whole exchanges and keeps
+a prose summary of them. It cannot drop just anything: a `tool_result` is only valid directly after
+the `tool_use` it answers, so a cut in the middle of an exchange produces a request the API rejects
+outright. The only safe cut is where the user typed something — everything before that point is
+complete. `Session::compaction_cut` finds the latest such point that still leaves `keep_recent_turns`
+intact, and refuses (returns `None`) rather than cutting somewhere unsafe.
+
+**Where the summary lives.** In the system prompt, as a second block — not as a message. A
+transcript has a shape the API enforces (roles alternate, tool results follow tool calls); splicing
+a summary in as a message breaks it, while dropping a prefix does not. The cache breakpoint moves to
+the last block, so the summary is cached too; it invalidates the prefix exactly once, at the same
+moment the messages it replaces disappear.
+
+**Two triggers, because one is not enough.**
+
+- *Before the wall:* the API reports `input_tokens` on every response, so the real number is known.
+  Past `compact_at_tokens` (100k by default, `MC_COMPACT_AT_TOKENS` to override) the conversation is
+  compacted between turns — never inside one, since compaction is another request and the user is
+  waiting on an answer.
+- *At the wall:* the threshold is a guess about a window nobody publishes, and a local model may
+  have 16k. So a request refused for length is recognised (`is_too_long`, matched on the message
+  because the error *code* is the same one every malformed request gets) and the turn compacts and
+  retries — once, so a conversation too long even after compacting fails honestly rather than
+  looping.
+
+**The summary is written for the model, not for the reader**: paths, decisions, what failed and why,
+what is unfinished. It is produced by a plain request — no tools, no thinking, not streamed — over a
+*rendered* excerpt rather than the messages themselves, because those messages contain `tool_use`
+blocks that are only valid alongside the tool definitions they came from.
+
+**And the user is told.** The chat's status line carries the live figure (`Ready · 11k context`), a
+notice appears in the transcript when older messages are summarized away, and a restored session
+that has been compacted says so on the first line — otherwise reopening it looks like messages went
+missing.

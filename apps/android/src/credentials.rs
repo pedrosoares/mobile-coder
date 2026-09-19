@@ -61,6 +61,18 @@ pub fn set(key: String) {
     }
 }
 
+/// Forget the key for this process, so "Forget key" means it now rather than
+/// after the next launch.
+pub fn clear() {
+    match API_KEY.write() {
+        Ok(mut slot) => {
+            *slot = None;
+            log::info!("api key cleared");
+        }
+        Err(_) => log::error!("credential lock poisoned; api key not cleared"),
+    }
+}
+
 pub fn get() -> Option<String> {
     API_KEY.read().ok().and_then(|slot| slot.clone())
 }
@@ -97,6 +109,15 @@ mod jni_bridge {
         outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>();
     }
 
+    /// `MainActivity.nativeClearApiKey`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeClearApiKey<'caller>(
+        _unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+    ) {
+        super::clear();
+    }
+
     /// `MainActivity.nativeSetApiKey`.
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeSetApiKey<'caller>(
@@ -123,5 +144,54 @@ mod tests {
         assert!(shown.starts_with("sk-ant-a"));
         assert!(!shown.contains("SECRET"), "redaction leaked the key: {shown}");
         assert!(shown.contains(&key.len().to_string()));
+    }
+}
+
+/// The GitHub token, handed over by `MainActivity` from the Keystore.
+///
+/// Kept beside the model's API key because the rule is the same: the plaintext
+/// lives in this process and nowhere else. It is passed to `mc-github`, which
+/// owns it from then on - this is only the doorway.
+static GITHUB_TOKEN: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_github_token(token: String) {
+    let redacted = mc_github::Token::new(token.clone()).redacted();
+    match GITHUB_TOKEN.write() {
+        Ok(mut slot) => {
+            *slot = Some(token.clone());
+            log::info!("github token received ({redacted})");
+        }
+        Err(_) => log::error!("credential lock poisoned; github token not installed"),
+    }
+    // Hand it straight to the Git pane rather than waiting to be asked. This
+    // arrives on the UI thread at launch, in a race with the native side
+    // starting: whoever is second has to be the one that tells the other.
+    mc_github::token::set(mc_github::Token::new(token));
+    mc_ui::git::send(mc_ui::git::Command::Refresh);
+}
+
+pub fn github_token() -> Option<String> {
+    GITHUB_TOKEN.read().ok().and_then(|slot| slot.clone())
+}
+
+#[cfg(target_os = "android")]
+mod github_bridge {
+    use jni::{
+        EnvUnowned,
+        objects::{JClass, JString},
+    };
+
+    /// `MainActivity.nativeSetGithubToken`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_net_pedrosoares_mobilecoder_MainActivity_nativeSetGithubToken<'caller>(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        token: JString<'caller>,
+    ) {
+        let outcome = unowned_env.with_env(|env| -> Result<(), jni::errors::Error> {
+            super::set_github_token(token.try_to_string(env)?);
+            Ok(())
+        });
+        outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>();
     }
 }

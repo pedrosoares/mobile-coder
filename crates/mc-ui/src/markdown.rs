@@ -335,9 +335,33 @@ pub fn render(source: &str) -> impl IntoElement {
                         .spacing(4.)
                         .corner_radius(8.)
                         .background(theme::SURFACE);
-                    if let Some(language) = language {
-                        card = card.child(label().text(language).font_size(11.).color(theme::MUTED));
-                    }
+                    // A code block is the thing most worth copying: a command
+                    // to run, a file to paste. Its header carries the button.
+                    let snippet = text.clone();
+                    card = card.child(
+                        rect()
+                            .content(Content::Flex)
+                            .horizontal()
+                            .width(Size::fill())
+                            .cross_align(Alignment::Center)
+                            .child(
+                                rect().width(Size::flex(1.)).child(
+                                    label()
+                                        .text(language.unwrap_or_default())
+                                        .font_size(11.)
+                                        .color(theme::MUTED),
+                                ),
+                            )
+                            .child(
+                                Button::new()
+                                    .compact()
+                                    .flat()
+                                    .on_press(move |_| crate::clipboard::copy(&snippet))
+                                    .child(
+                                        label().text("Copy").font_size(11.).color(theme::MUTED),
+                                    ),
+                            ),
+                    );
                     card.child(
                         // The font goes on the paragraph, not the span: Freya
                         // ignores span-level font families (see `spans`).

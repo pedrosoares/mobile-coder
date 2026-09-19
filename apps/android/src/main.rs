@@ -14,6 +14,9 @@ fn main() {
                 native_composer: false,
                 files: None,
                 shell: None,
+                sandbox: None,
+                sessions: None,
+                restored: None,
             })
                 .with_size(420., 860.)
                 .with_title("mobile-coder"),

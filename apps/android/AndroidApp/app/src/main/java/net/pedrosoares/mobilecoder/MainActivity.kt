@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.SurfaceView
@@ -82,6 +83,166 @@ class MainActivity : NativeActivity() {
     /** Whether an agent turn is running. Implemented in agent_task.rs. */
     private external fun nativeIsBusy(): Boolean
 
+    /** Stops the running turn. Implemented in agent_task.rs. */
+    private external fun nativeStopTurn()
+
+    /** True once when the user taps the settings button. Implemented in agent_task.rs. */
+    private external fun nativeTakeSettingsRequest(): Boolean
+
+    /** Text the app wants on the clipboard, or "". Implemented in agent_task.rs. */
+    private external fun nativeTakeClipboard(): String
+
+    /** Drops the key from the running agent. Implemented in credentials.rs. */
+    private external fun nativeClearApiKey()
+
+    /** Hands the GitHub token to the Git pane. Implemented in credentials.rs. */
+    private external fun nativeSetGithubToken(token: String)
+
+    /** Which field the UI is waiting for, 0 for none. Implemented in agent_task.rs. */
+    private external fun nativeTakePromptRequest(): Int
+
+    /** The title, hint and flags for a prompt, as "title\u0000hint\u00000|1\u00000|1". */
+    private external fun nativePromptSpec(kind: Int): String
+
+    /** Hands back what the user typed. Implemented in agent_task.rs. */
+    private external fun nativeAnswerPrompt(kind: Int, text: String)
+
+    /** True once when the user signs out of GitHub. Implemented in agent_task.rs. */
+    private external fun nativeTakeGithubForget(): Boolean
+
+    /** What is running, or "" for nothing. Implemented in agent_task.rs. */
+    private external fun nativeWorkSummary(): String
+
+    /**
+     * Keep the app out of the freezer while its processes have work to do.
+     *
+     * Android freezes a cached app, and the sandbox is inside this app: a
+     * server stops answering, a build stops compiling, a job stops counting.
+     * A foreground service is the only thing that prevents it - so one runs
+     * exactly while there is work, plus whenever the user has pinned it on.
+     */
+    private fun syncKeepAlive() {
+        val summary = nativeWorkSummary()
+        val pinned = getSharedPreferences(ENDPOINT_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_KEEP_AWAKE, false)
+        if (summary.isEmpty()) {
+            // Nothing running: a Stop pressed earlier should not mute the next
+            // job too.
+            KeepAlive.workEnded()
+        }
+        KeepAlive.sync(
+            context = this,
+            wanted = summary.isNotEmpty() || pinned,
+            summary = summary.ifEmpty { "Keeping the sandbox awake" },
+        )
+    }
+
+    /** Ask to show the keep-alive notification, on the releases that require it. */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        // Denied is survivable: the service still runs and still keeps the
+        // sandbox alive, the user just cannot see or stop it from the shade.
+        requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+    }
+
+    /** Ask for one line of text on behalf of the Git pane. */
+    private fun openPrompt(kind: Int) {
+        // The wording lives in Rust with the screen that asks, so the two
+        // cannot drift apart.
+        val spec = nativePromptSpec(kind).split("\u0000")
+        if (spec.size < 4) return
+        composer.setSuspended(true)
+        TextPromptDialog.show(
+            activity = this,
+            title = spec[0],
+            hint = spec[1],
+            secret = spec[2] == "1",
+            multiline = spec[3] == "1",
+            onText = { text ->
+                if (text.isNotBlank()) {
+                    // A token is stored here and nowhere else; the rest is just
+                    // text on its way to the pane.
+                    if (kind == PROMPT_GITHUB_TOKEN) {
+                        KeyVault.storeGithub(this, text.trim())
+                    }
+                    nativeAnswerPrompt(kind, text)
+                }
+            },
+            onClosed = { composer.setSuspended(false) },
+        )
+    }
+
+    /**
+     * Anything the Freya side cannot do itself, polled from the UI thread.
+     *
+     * Both of these must happen here: a dialog and the clipboard belong to the
+     * Activity's thread, and Freya runs elsewhere. A quarter-second is under
+     * the threshold where a tap feels unacknowledged.
+     */
+    private fun watchNativeRequests() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        handler.post(object : Runnable {
+            override fun run() {
+                if (nativeTakeSettingsRequest()) openSettings()
+                val prompt = nativeTakePromptRequest()
+                if (prompt != 0) openPrompt(prompt)
+                if (nativeTakeGithubForget()) {
+                    KeyVault.clearGithub(this@MainActivity)
+                    Log.i(TAG, "github token deleted from this device")
+                }
+                val copied = nativeTakeClipboard()
+                if (copied.isNotEmpty()) putOnClipboard(copied)
+                syncKeepAlive()
+                handler.postDelayed(this, 250)
+            }
+        })
+    }
+
+    private fun putOnClipboard(text: String) {
+        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+        if (clipboard == null) {
+            Log.w(TAG, "no clipboard service; copy dropped")
+            return
+        }
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("mobile-coder", text))
+        // Android 13+ shows its own copy confirmation; older releases show
+        // nothing, so say it once here rather than twice there.
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) {
+            android.widget.Toast
+                .makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT)
+                .show()
+        }
+    }
+
+    private fun openSettings() {
+        composer.setSuspended(true)
+        SettingsDialog.show(
+            activity = this,
+            hasKey = KeyVault.load(this) != null,
+            onApplied = { apiKey, baseUrl, model ->
+                apiKey?.let {
+                    KeyVault.store(this, it)
+                    nativeSetApiKey(it)
+                }
+                nativeSetEndpoint(baseUrl, model)
+                // credentials.rs logs which endpoint and model took effect; no
+                // point printing the same pair twice.
+                Log.i(TAG, "settings applied")
+            },
+            onCleared = {
+                KeyVault.clear(this)
+                nativeClearApiKey()
+                Log.i(TAG, "api key forgotten")
+            },
+            onClosed = { composer.setSuspended(false) },
+        )
+    }
+
     /** 0 hidden, 1 chat, 2 terminal. Implemented in agent_task.rs. */
     private external fun nativeComposerMode(): Int
 
@@ -107,6 +268,7 @@ class MainActivity : NativeActivity() {
             activity = this,
             onSubmit = { text -> nativeRunPrompt(text) },
             onTerminalInput = { text -> nativeTerminalInput(text) },
+            onStop = { nativeStopTurn() },
             isBusy = { nativeIsBusy() },
             mode = { nativeComposerMode() },
             onVisibilityChanged = { reportSafeArea() },
@@ -153,6 +315,13 @@ class MainActivity : NativeActivity() {
 
     companion object {
         private const val TAG = "mobile-coder"
+
+        /** Matches `mc_ui::prompt::Prompt`; the numbers are the interface. */
+        private const val PROMPT_GITHUB_TOKEN = 1
+
+        /** Where the endpoint, model and keep-awake switch are remembered. */
+        const val ENDPOINT_PREFS = "endpoint"
+        const val PREF_KEEP_AWAKE = "keep_awake"
 
         // NativeActivity loads this itself, but we need it before super.onCreate
         // returns so the key can be installed as early as possible. loadLibrary
@@ -221,7 +390,7 @@ class MainActivity : NativeActivity() {
      * host's localhost; a physical phone needs the machine's LAN address.
      */
     private fun applyEndpoint() {
-        val prefs = getSharedPreferences("endpoint", MODE_PRIVATE)
+        val prefs = getSharedPreferences(ENDPOINT_PREFS, MODE_PRIVATE)
         val edit = prefs.edit()
         intent?.getStringExtra("base_url")?.let { edit.putString("base_url", it.trim()); intent.removeExtra("base_url") }
         intent?.getStringExtra("model")?.let { edit.putString("model", it.trim()); intent.removeExtra("model") }
@@ -237,6 +406,9 @@ class MainActivity : NativeActivity() {
             null -> Log.i(TAG, "no api key stored; the agent will stay idle")
             else -> nativeSetApiKey(key)
         }
+        // Before the UI starts, so the Git pane opens already signed in rather
+        // than asking for a token the device already has.
+        KeyVault.loadGithub(this)?.let { nativeSetGithubToken(it) }
         runPromptFromIntent()
     }
 
@@ -244,6 +416,8 @@ class MainActivity : NativeActivity() {
         super.onCreate(savedInstanceState)
 
         watchDnsServers()
+        watchNativeRequests()
+        requestNotificationPermission()
         installComposer()
         watchInsets()
         applyIntent()

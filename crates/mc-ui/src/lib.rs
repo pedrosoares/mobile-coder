@@ -3,10 +3,32 @@
 //! Phone-first: a single pane with a switcher, not a desktop IDE's split panes
 //! shrunk down. The UI never talks to Claude itself; it drives an
 //! [`mc_core::AgentHandle`] handed in by the app shell.
+//!
+//! # One rule worth knowing before editing anything here
+//!
+//! Writing to a `State` while a read guard on it is alive panics, and on
+//! Android that panic takes the window down. The trap is that a temporary lives
+//! to the end of its statement, and the scrutinee of an `if let` or `match`
+//! lives for the whole construct:
+//!
+//! ```ignore
+//! if let Some(x) = *thing.peek() { thing.set(None); }   // panics
+//! let current = *thing.peek();                          // guard dropped here
+//! if let Some(x) = current { thing.set(None); }         // fine
+//! ```
+//!
+//! The condition of a plain `if` is its own temporary scope, so `if
+//! *a.peek() != b { a.set(b) }` is safe - which is why this is easy to get
+//! wrong. Read into a local first and the question does not arise. Three
+//! separate crashes in this crate have been this, each found by running the app
+//! rather than by the compiler.
 
 pub mod chat;
+pub mod clipboard;
 pub mod files;
+pub mod git;
 pub mod markdown;
+pub mod prompt;
 pub mod safe_area;
 pub mod terminal;
 pub mod theme;
@@ -22,16 +44,20 @@ pub enum Pane {
     Chat,
     Terminal,
     Files,
+    Git,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 3] = [Pane::Chat, Pane::Terminal, Pane::Files];
+    pub const ALL: [Pane; 4] = [Pane::Chat, Pane::Terminal, Pane::Files, Pane::Git];
 
     pub fn label(self) -> &'static str {
         match self {
             Pane::Chat => "Chat",
-            Pane::Terminal => "Terminal",
+            // Short, because four tabs plus a title have to fit across a folded
+            // phone: 968 logical pixels, and "Terminal" is the long one.
+            Pane::Terminal => "Term",
             Pane::Files => "Files",
+            Pane::Git => "Git",
         }
     }
 
@@ -50,6 +76,19 @@ const APP_BAR_HEIGHT: f32 = 56.0;
 /// Title on the left, pane switcher on the right, a hairline below.
 fn app_bar(current: Pane, mut pane: State<Pane>) -> impl IntoElement {
     let mut tabs = rect().horizontal().spacing(4.).cross_align(Alignment::Center);
+
+    // Settings are a native dialog on Android (see `safe_area`); on desktop the
+    // key and endpoint come from the environment, so the button would do
+    // nothing and is left out.
+    if cfg!(target_os = "android") {
+        tabs = tabs.child(
+            Button::new()
+                .compact()
+                .flat()
+                .on_press(|_| safe_area::request_settings())
+                .child("⚙"),
+        );
+    }
     for option in Pane::ALL.into_iter().filter(|p| p.available()) {
         let button = Button::new()
             .compact()
@@ -101,6 +140,13 @@ pub struct MobileCoder {
     pub files: Option<Arc<dyn FileBrowser>>,
     /// Starts the shell for the Terminal pane.
     pub shell: Option<Arc<dyn ShellLauncher>>,
+    /// Makes a sandbox for the Git pane to run git in.
+    pub sandbox: Option<Arc<dyn mc_sandbox::SandboxFactory>>,
+    /// Where the chats are kept. Without one the app still works - it just has
+    /// a single unnamed conversation, which is what it had before.
+    pub sessions: Option<Arc<mc_core::SessionLibrary>>,
+    /// The conversation restored from disk, if there was one.
+    pub restored: Option<ChatLog>,
 }
 
 impl App for MobileCoder {
@@ -115,8 +161,9 @@ impl App for MobileCoder {
         // Everything a pane must not lose when the user looks at another tab
         // lives here, in the root's scope, which is never unmounted.
         let agent = self.agent.clone();
+        let restored = self.restored.clone();
         let log = use_state(move || {
-            let mut log = ChatLog::default();
+            let mut log = restored.unwrap_or_default();
             if agent.is_none() {
                 log.notice(
                     "No model is configured. On desktop set ANTHROPIC_API_KEY, or \
@@ -129,13 +176,25 @@ impl App for MobileCoder {
         let draft = use_state(String::new);
         let shell = use_state(terminal::ShellSession::default);
         let files_cwd = use_state(String::new);
+        let git_draft = use_state(String::new);
+        let git_asking = use_state(|| None);
+        let picking = use_state(|| false);
 
         // Long-lived tasks, for the same reason: an agent reply that arrives
         // while the Terminal is on screen still lands in the chat.
         let agent = self.agent.clone();
+        let sandbox = self.sandbox.clone();
+        let sessions = self.sessions.clone();
+        let following = self.agent.clone();
         use_hook(move || {
             chat::collect_events(agent, log);
+            chat::follow_open_chats(following, sessions, log);
             terminal::deliver_input(shell);
+            // The git worker owns a runtime of its own, so it starts once here
+            // rather than per visit to the pane.
+            if let Some(factory) = sandbox {
+                git::start(factory);
+            }
         });
 
         // Poll rather than subscribe: insets change on the Android UI thread,
@@ -159,13 +218,17 @@ impl App for MobileCoder {
         safe_area::set_composer_mode(match current {
             Pane::Chat => safe_area::ComposerMode::Chat,
             Pane::Terminal => safe_area::ComposerMode::Terminal,
-            Pane::Files => safe_area::ComposerMode::Hidden,
+            // Neither the Files list nor the Git pane has anywhere to type:
+            // both collect text in a dialog when they need it.
+            Pane::Files | Pane::Git => safe_area::ComposerMode::Hidden,
         });
 
         let body: Element = match *pane.read() {
             Pane::Chat => chat::ChatView {
                 agent: self.agent.clone(),
                 native_composer: self.native_composer,
+                library: self.sessions.clone(),
+                picking,
                 log,
                 draft,
             }
@@ -178,6 +241,14 @@ impl App for MobileCoder {
             Pane::Terminal => terminal::TerminalView {
                 launcher: self.shell.clone(),
                 session: shell,
+            }
+            .into_element(),
+            Pane::Git => git::GitView {
+                // The same platform limit that gives the chat a native message
+                // box: no typed text reaches Freya on Android.
+                native_prompts: self.native_composer,
+                draft: git_draft,
+                asking: git_asking,
             }
             .into_element(),
         };

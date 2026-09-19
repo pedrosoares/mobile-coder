@@ -72,6 +72,16 @@ fn default_shell_command(shell: &str, args: &[String]) {
     // ignored: SIGINT/SIGQUIT from a background-job launch, and
     // SIGPIPE which the Rust runtime always sets to ignore. Reset
     // the full set to default before exec.
+    //
+    // Blocked signals survive exec as well, and an Android app runs
+    // its threads with several blocked - SIGPIPE included - which is
+    // just as fatal to a pipeline as ignoring it: `yes | head` never
+    // ends. Clear the mask too.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
     unsafe {
         libc::signal(libc::SIGABRT, libc::SIG_DFL);
         libc::signal(libc::SIGALRM, libc::SIG_DFL);

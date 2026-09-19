@@ -1,0 +1,21 @@
+[package]
+name = "mc-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mc-core = { workspace = true }
+mc-sandbox = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+# A proxy needs a server as well as a client. All three already build as part of
+# reqwest, so this adds no compilation - only API surface.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"

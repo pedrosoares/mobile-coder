@@ -45,6 +45,8 @@ class NativeComposer(
     private val onSubmit: (String) -> Unit,
     /** Raw input for the shell, control characters included. */
     private val onTerminalInput: (String) -> Unit,
+    /** Stop the turn that is running. */
+    private val onStop: () -> Unit,
     private val isBusy: () -> Boolean,
     /** What the Freya UI wants: 0 hidden, 1 chat, 2 terminal (mc-ui ComposerMode). */
     private val mode: () -> Int,
@@ -67,6 +69,7 @@ class NativeComposer(
     private val ink = Color.rgb(223, 232, 234)
     private val muted = Color.rgb(133, 150, 155)
     private val accent = Color.rgb(91, 187, 176)
+    private val danger = Color.rgb(219, 124, 109)
     private val ground = Color.rgb(12, 19, 21)
 
     private val input = EditText(activity).apply {
@@ -102,7 +105,10 @@ class NativeComposer(
         isAllCaps = false
         setTextColor(ground)
         backgroundTintList = ColorStateList.valueOf(accent)
-        setOnClickListener { submit() }
+        setOnClickListener {
+            // While the agent works this button stops it; otherwise it sends.
+            if (currentMode == MODE_CHAT && isBusy()) onStop() else submit()
+        }
     }
 
     private val inputRow = LinearLayout(activity).apply {
@@ -191,6 +197,24 @@ class NativeComposer(
     private var anchor: View? = null
 
     /**
+     * Held down while a dialog is up.
+     *
+     * The bar's popup window is focusable - it has to be, or the keyboard would
+     * have nothing to attach to - and a focusable popup keeps the input focus
+     * even when a dialog opens above it. Typing into the settings form landed
+     * in the message box instead (measured on the emulator). So the bar steps
+     * aside for as long as a dialog is showing.
+     */
+    private var suspended = false
+
+    /** Take the bar away (and give up the keyboard) while a dialog is open. */
+    fun setSuspended(value: Boolean) {
+        if (value == suspended) return
+        suspended = value
+        applyVisibility(!suspended && mode() != MODE_HIDDEN)
+    }
+
+    /**
      * Show the bar. Must run once the activity window is attached.
      *
      * The keyboard inset is read from the popup's own window, not the
@@ -277,6 +301,7 @@ class NativeComposer(
      * button at the bottom edge of the Files pane).
      */
     private fun applyVisibility(wanted: Boolean) {
+        val wanted = wanted && !suspended
         if (wanted == popup.isShowing) return
         if (wanted) {
             val target = anchor ?: return
@@ -310,14 +335,19 @@ class NativeComposer(
                 // The shell is independent of the agent: never blocked by a turn.
                 send.isEnabled = true
                 send.alpha = 1f
-                input.hint = "Type a command"
+                send.text = "Send"
+            send.backgroundTintList = ColorStateList.valueOf(accent)
+            input.hint = "Type a command"
                 handler.postDelayed(this, 250)
                 return
             }
             val busy = isBusy()
-            send.isEnabled = !busy
-            send.alpha = if (busy) 0.4f else 1f
-            input.hint = if (busy) "Waiting for the agent…" else "Ask the agent to build something"
+            // Enabled either way: as Send when idle, as Stop while working.
+            send.isEnabled = true
+            send.alpha = 1f
+            send.text = if (busy) "Stop" else "Send"
+            send.backgroundTintList = ColorStateList.valueOf(if (busy) danger else accent)
+            input.hint = if (busy) "Working… (Stop to interrupt)" else "Ask the agent to build something"
             handler.postDelayed(this, 250)
         }
     }

@@ -18,6 +18,12 @@ use mc_agent::{Agent, AgentConfig};
 use mc_core::{Event, EventBus, Project, Session};
 use mc_sandbox::Sandbox;
 
+/// Where the conversation is kept, inside the workspace.
+/// Where the chats are kept inside the workspace, one file per chat.
+const SESSIONS_DIR: &str = ".mobile-coder-chats";
+/// The single file used before chats were plural.
+const LEGACY_SESSION_FILE: &str = ".mobile-coder-session.json";
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -41,6 +47,19 @@ fn main() {
     }
 
     let (agent, workspace) = start_chat_agent();
+    // Show yesterday's conversation, rebuilt from the transcript the worker
+    // resumed from.
+    let sessions = workspace
+        .as_ref()
+        .map(|dir| {
+            let library = mc_core::SessionLibrary::new(dir.join(SESSIONS_DIR));
+            library.adopt(&dir.join(LEGACY_SESSION_FILE));
+            std::sync::Arc::new(library)
+        });
+    let restored = sessions
+        .as_ref()
+        .and_then(|library| library.most_recent())
+        .map(|session| mc_core::ChatLog::from_session(&session));
     // Browse the same directory the agent works in. "/" in the Files pane is
     // the workspace root, matching how the agent's host sandbox sees it.
     let files: Option<std::sync::Arc<dyn mc_core::FileBrowser>> = workspace
@@ -49,17 +68,58 @@ fn main() {
     // Your own shell, in the same workspace the agent uses.
     let cwd = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let shell: Option<std::sync::Arc<dyn mc_core::ShellLauncher>> =
-        Some(std::sync::Arc::new(mc_sandbox::HostShell { cwd }));
+        Some(std::sync::Arc::new(mc_sandbox::HostShell { cwd: cwd.clone() }));
+    // The Git pane runs git where the agent runs it: on this machine, in the
+    // workspace. On a phone that is the sandbox; here it is the host shell.
+    let sandbox: Option<std::sync::Arc<dyn mc_sandbox::SandboxFactory>> =
+        Some(std::sync::Arc::new(HostSandbox(cwd.clone())));
+
+    // Desktop has no Keystore; the token comes from the environment, the same
+    // way the API key does.
+    if let Some(token) = mc_github::token::from_env() {
+        mc_github::token::set(token);
+    }
+
+    // Copy buttons reach the window system through Freya's clipboard, which
+    // exists only once a window does - so this runs on the render thread, from
+    // a button handler, and never from the agent's threads.
+    mc_ui::clipboard::install(Box::new(|text| {
+        freya::clipboard::Clipboard::set(text.to_string()).map_err(|e| format!("{e:?}"))
+    }));
 
     // A phone-shaped window, so layout problems show up here rather than on
     // device where the iteration loop is far slower.
     launch(
         LaunchConfig::new().with_window(
-            WindowConfig::new_app(mc_ui::MobileCoder { agent, native_composer: false, files, shell })
+            WindowConfig::new_app(mc_ui::MobileCoder {
+                agent,
+                native_composer: false,
+                files,
+                shell,
+                sandbox,
+                sessions,
+                restored,
+            })
                 .with_size(420., 860.)
                 .with_title("mobile-coder (desktop)"),
         ),
     )
+}
+
+/// A sandbox that is just this machine. See [`mc_sandbox::Sandbox::host`].
+#[derive(Debug)]
+struct HostSandbox(PathBuf);
+
+impl mc_sandbox::SandboxFactory for HostSandbox {
+    fn create(&self) -> Result<mc_sandbox::Sandbox, String> {
+        Ok(mc_sandbox::Sandbox::host())
+    }
+
+    /// Beside the agent's workspace, not at `/root/projects`: this sandbox is
+    /// the machine itself.
+    fn projects_dir(&self) -> String {
+        self.0.join("projects").display().to_string()
+    }
 }
 
 /// Start the agent behind the chat, if a model is configured.
@@ -91,10 +151,11 @@ fn start_chat_agent() -> (Option<mc_core::AgentHandle>, Option<PathBuf>) {
         workspace.display()
     );
 
-    let handle = worker::spawn(
+    let handle = worker::spawn_with_library(
         EventBus::default(),
         Project { name: "workspace".into(), path: workspace.clone() },
         Box::new(move || Ok((config.clone(), Sandbox::host()))),
+        Some(workspace.join(SESSIONS_DIR)),
     );
     (Some(handle), Some(workspace))
 }
