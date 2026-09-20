@@ -1,6 +1,6 @@
 // Copyright (c) 2023-present, Raphael Amorim.
 //
-// This source code is licensed under the MIT license found in the
+// This source code is licensed under the GPL-3.0 license license found in the
 // LICENSE file in the root directory of this source tree.
 
 //! Screen serialization: one walk of the active screen with several emit
@@ -74,8 +74,7 @@ impl<U: EventListener> Crosswords<U> {
             return String::new();
         }
         let start = crate::crosswords::pos::Pos::new(Line(0), Column(0));
-        let end =
-            crate::crosswords::pos::Pos::new(Line(rows as i32 - 1), Column(cols - 1));
+        let end = crate::crosswords::pos::Pos::new(Line(rows as i32 - 1), Column(cols - 1));
         self.bounds_to_string(start, end)
     }
 

@@ -412,7 +412,6 @@ mc-agent ── POST /v1/messages (SSE) ──▶ Claude API
 
 **Toolchain:** Android SDK (API 36 for `compileSdk`), NDK **r26d**, `cargo-ndk`, and the
 `aarch64-linux-android` Rust target. `x86_64-linux-android` is worth adding for emulator work.
-None of this is installed on the current dev machine yet.
 
 **`compileSdk 36`, `targetSdk 36`, `minSdk 24`.** Current target, Play distribution retained,
 contingent on the probe. If the probe comes back negative, dropping to `targetSdk 28` is a
@@ -425,6 +424,25 @@ in its build script and panics without it. Worth knowing before concluding the A
 broken.
 
 **Distribution:** F-Droid or direct APK. Not Google Play — see §2.2.
+
+**Releases are built by `.github/workflows/release-apk.yml`**, on a `v*` tag or a published
+release, and the APK is attached to that release. Three things about it are decisions rather than
+boilerplate:
+
+- **arm64 only, by default.** x86_64 is emulator-only, and the sandbox cannot even `fork` there
+  (§2.2), so shipping it would double the build and the download for something that cannot run the
+  thing this app is for. `workflow_dispatch` can ask for both.
+- **`-Pmc.abi` drives the packaging as well as the Rust build.** They used to be separate lists,
+  which is how an "arm64-only" APK came out carrying a stale `x86_64` library from an emulator
+  build — 23 MB instead of 13 MB, measured here.
+- **Signed when a keystore is available, debug-signed when not.** The keystore comes from repository
+  secrets (`ANDROID_KEYSTORE_BASE64` and friends) and is decoded into the runner's temp directory,
+  never the repository. Without it a *release* build is unsigned, and an unsigned APK will not
+  install — so the workflow builds the debug variant instead and says so in the release notes.
+  A debug-signed APK installs and runs; it just cannot be upgraded over one signed with another key.
+
+The version comes from the tag: `v0.2.0` becomes `versionName 0.2.0` and `versionCode 20000`
+(major×10000 + minor×100 + patch, which keeps the integer ordering the tags have).
 
 **Dev loop:** `cargo run -p desktop` for essentially all work. Gradle `assembleDebug` +
 `adb install` only for integration passes.

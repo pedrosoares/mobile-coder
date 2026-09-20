@@ -3,7 +3,7 @@
 #![allow(warnings)]
 // Copyright (c) 2023-present, Raphael Amorim.
 //
-// This source code is licensed under the MIT license found in the
+// This source code is licensed under the GPL-3.0 license license found in the
 // LICENSE file in the root directory of this source tree.
 
 //! Rio's embeddable terminal core: the VT state machine (`crosswords`),

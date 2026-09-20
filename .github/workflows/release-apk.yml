@@ -1,0 +1,221 @@
+# Build the APK for a tag and attach it to that tag's release.
+#
+# Two ways in, because there are two ways people cut a release:
+#
+#   - pushing a `v*` tag, in which case the release is created here;
+#   - publishing a release in the GitHub UI, in which case the APK is added to it.
+#
+# Either way the upload is idempotent, so a re-run replaces the asset rather
+# than failing or leaving two.
+name: Release APK
+
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach to (e.g. v0.2.0)"
+        required: true
+      abis:
+        description: "ABIs to build"
+        default: arm64-v8a
+        type: choice
+        options: [arm64-v8a, "arm64-v8a,x86_64"]
+
+# Only to upload the asset; nothing here reads anything else.
+permissions:
+  contents: write
+
+# A tag pushed and a release published for the same tag would otherwise build
+# twice, in parallel, and race each other's upload.
+concurrency:
+  group: release-apk-${{ github.event.release.tag_name || github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  # r26d, the version this project is built and tested with.
+  NDK_VERSION: 26.3.11579264
+  # x86_64 is emulator-only, and the sandbox cannot even fork there (Android's
+  # seccomp filter allows `fork` for lp32 processes only - see
+  # docs/EXEC-PROBE.md), so a release ships arm64 unless asked otherwise.
+  ABIS: ${{ inputs.abis || 'arm64-v8a' }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    # Skia and the Rust dependency tree from cold; the caches below usually make
+    # it a fraction of this.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag, explicitly: a release published from the UI reports the tag
+          # in the event, and relying on `github.ref` to mean the same thing in
+          # all three trigger cases is the kind of assumption that builds the
+          # wrong commit.
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name || inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          # A version code has to increase with every release, and Android only
+          # takes an integer: 1.2.3 -> 10203, which orders the same way.
+          code=$(printf '%s' "$version" | awk -F'[.-]' '{ printf "%d", ($1*10000)+($2*100)+$3 }')
+          [ "${code:-0}" -gt 0 ] || code=1
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "version=$version"    >> "$GITHUB_OUTPUT"
+          echo "code=$code"          >> "$GITHUB_OUTPUT"
+          echo "Building $tag as versionName=$version versionCode=$code"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # Gradle 8.13 with AGP 8.7 refuses anything newer.
+          java-version: "21"
+
+      - name: Install the SDK pieces this build needs
+        run: |
+          set -euo pipefail
+          sdk="$(command -v sdkmanager || true)"
+          [ -n "$sdk" ] || sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          # A here-string, not `yes |`. sdkmanager stops reading once it has
+          # accepted everything, `yes` then dies of SIGPIPE, and `pipefail`
+          # turns that into a failed step - exit 141, with the only clue being
+          # "yes: standard output: Broken pipe". Nothing is piped here, so
+          # there is no pipe to break.
+          "$sdk" --licenses > /dev/null <<< "$(printf 'y\n%.0s' $(seq 1 50))"
+          "$sdk" "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Rust, for the ABIs being built
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          for abi in ${ABIS//,/ }; do
+            case "$abi" in
+              arm64-v8a) rustup target add aarch64-linux-android ;;
+              x86_64)    rustup target add x86_64-linux-android ;;
+            esac
+          done
+
+      # Keyed on the lockfile: a dependency change rebuilds, everything else
+      # reuses. Skia alone is most of a cold build.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ env.ABIS }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ env.ABIS }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/android/AndroidApp/**/*.gradle.kts', 'apps/android/AndroidApp/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: cargo-ndk
+        run: command -v cargo-ndk || cargo install cargo-ndk --locked
+
+      # proot and its libraries are not in the repository: they are fetched from
+      # Termux's package pool and patched (see the script). Without them the app
+      # installs and then cannot start a sandbox at all.
+      - name: Fetch proot
+        run: |
+          set -euo pipefail
+          tools/fetch-proot.sh apps/android/AndroidApp/app/src/main/jniLibs ${ABIS//,/ }
+
+      - name: Decode the signing key, if there is one
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            # Not a failure. A debug-signed APK installs and runs; it just
+            # cannot be upgraded over a differently-signed one, so say so in
+            # the release notes rather than shipping something unsigned.
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "No ANDROID_KEYSTORE_BASE64 secret; building the debug-signed APK."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build the APK
+        id: build
+        env:
+          MC_KEYSTORE: ${{ steps.signing.outputs.signed == 'true' && format('{0}/release.jks', runner.temp) || '' }}
+          MC_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MC_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MC_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          variant=$([ "${{ steps.signing.outputs.signed }}" = "true" ] && echo Release || echo Debug)
+          cd apps/android/AndroidApp
+          ./gradlew --no-daemon "assemble$variant" \
+            -Pmc.abi="$ABIS" \
+            -PmcVersionName="${{ steps.version.outputs.version }}" \
+            -PmcVersionCode="${{ steps.version.outputs.code }}"
+
+          # This variant's directory only, and never the unsigned artefact a
+          # release build leaves behind when there is no keystore - picking that
+          # up would ship an APK Android refuses to install.
+          dir="app/build/outputs/apk/$(echo "$variant" | tr '[:upper:]' '[:lower:]')"
+          # `-print -quit` rather than `| head -1`, for the same reason as the
+          # licences above: `head` closing the pipe early would kill `find` with
+          # SIGPIPE and `pipefail` would fail the step.
+          out=$(find "$dir" -name '*.apk' ! -name '*unsigned*' -print -quit)
+          [ -n "$out" ] || { echo "no APK in $dir" >&2; exit 1; }
+          name="mobile-coder-${{ steps.version.outputs.tag }}.apk"
+          cp "$out" "$RUNNER_TEMP/$name"
+          echo "apk=$RUNNER_TEMP/$name" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Check it is really signed
+        run: |
+          set -euo pipefail
+          apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$apksigner" verify --print-certs "${{ steps.build.outputs.apk }}"
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          APK: ${{ steps.build.outputs.apk }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          set -euo pipefail
+          note="Built from $TAG for $ABIS."
+          if [ "$SIGNED" != "true" ]; then
+            note="$note
+
+          This APK is **debug-signed**: it installs and runs, but Android will
+          refuse to upgrade over a copy signed with a different key. Add the
+          \`ANDROID_KEYSTORE_BASE64\`, \`ANDROID_KEYSTORE_PASSWORD\`,
+          \`ANDROID_KEY_ALIAS\` and \`ANDROID_KEY_PASSWORD\` secrets for a
+          properly signed build."
+          fi
+
+          # The tag may have been pushed without a release; make one then.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes --notes "$note"
+          fi
+          # --clobber: a re-run replaces the asset instead of failing.
+          gh release upload "$TAG" "$APK" --clobber
+          echo "Attached $APK to $TAG" >> "$GITHUB_STEP_SUMMARY"

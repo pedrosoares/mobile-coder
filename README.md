@@ -117,6 +117,36 @@ Anthropic SDK for Rust, so the wire format is ours: see `crates/mc-agent/src/wir
 particularly `StreamAccumulator`, which rebuilds messages from SSE deltas while
 keeping thinking signatures and unknown block types intact.
 
+## Releases
+
+Tag a commit `v0.2.0` and push it, or publish a release for that tag, and
+[`.github/workflows/release-apk.yml`](.github/workflows/release-apk.yml) builds
+the APK and attaches it to the release. The version comes from the tag.
+
+The APK is arm64 only. `x86_64` builds, but the sandbox cannot `fork` there
+(it is an emulator-only ABI — see `docs/EXEC-PROBE.md`), so it is not worth the
+download; a manual run of the workflow can ask for both.
+
+**To get properly signed builds**, add four repository secrets:
+
+```sh
+keytool -genkeypair -keystore release.jks -alias mobile-coder \
+  -keyalg RSA -keysize 2048 -validity 10000
+base64 -w0 release.jks     # → ANDROID_KEYSTORE_BASE64
+```
+
+| Secret | What it is |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | the keystore above, base64 |
+| `ANDROID_KEYSTORE_PASSWORD` | its store password |
+| `ANDROID_KEY_ALIAS` | the key alias (`mobile-coder` above) |
+| `ANDROID_KEY_PASSWORD` | the key password, if it differs from the store's |
+
+Without them the workflow still produces an APK, debug-signed: it installs and
+runs, but Android will refuse to upgrade over a copy signed with a different
+key. Keep the keystore file somewhere safe — losing it means every future
+release is a fresh install for anyone who already has the app.
+
 ## The constraint worth knowing before you read the code
 
 An Android app targeting API 29+ may not `exec()` files in its own data
@@ -128,4 +158,4 @@ measures whether that escape actually carries a Linux userland.
 
 ## Licence
 
-MIT.
+GPL-3.0 license.

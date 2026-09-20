@@ -3,6 +3,29 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// The version is a property so a release build can carry the tag it was cut
+// from: `-PmcVersionName=0.2.0 -PmcVersionCode=200`. Left alone, it is whatever
+// a local build has always been.
+val mcVersionName = (project.findProperty("mcVersionName") as String?) ?: "0.1"
+val mcVersionCode = (project.findProperty("mcVersionCode") as String?)?.toIntOrNull() ?: 1
+
+// Signing is opt-in through the environment, so the keystore never lives in the
+// repository and a checkout with no secrets still builds. Without it, a release
+// build is unsigned and Android will not install it - which is why the workflow
+// falls back to the debug build rather than shipping something that cannot be
+// installed.
+val keystore = System.getenv("MC_KEYSTORE")?.takeIf { File(it).exists() }
+
+// `-Pmc.abi=<abi>[,<abi>]` picks the ABIs, for the Rust build *and* for what is
+// packaged. Two lists that can disagree is how a release APK ends up carrying a
+// stale library from an emulator build: measured here, an arm64-only build that
+// still declared `native-code: 'arm64-v8a' 'x86_64'`.
+val mcAbis = (project.findProperty("mc.abi") as String?)
+    ?.split(",")
+    ?.map(String::trim)
+    ?.filter { it.isNotEmpty() }
+    ?: listOf("arm64-v8a", "x86_64")
+
 android {
     namespace = "net.pedrosoares.mobilecoder"
     compileSdk = 36
@@ -15,9 +38,9 @@ android {
         // Measured as viable: proot runs a Linux userland here with SELinux
         // enforcing. See docs/EXEC-PROBE.md before lowering this.
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
-        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        versionCode = mcVersionCode
+        versionName = mcVersionName
+        ndk { abiFilters += mcAbis }
     }
 
     // cargo-ndk writes libmobile_coder.so here; tools/fetch-proot.sh drops
@@ -32,8 +55,22 @@ android {
         jniLibs { useLegacyPackaging = true }
     }
 
+    if (keystore != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = File(keystore)
+                storePassword = System.getenv("MC_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("MC_KEY_ALIAS")
+                keyPassword = System.getenv("MC_KEY_PASSWORD") ?: System.getenv("MC_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
+        }
         debug { isJniDebuggable = true }
     }
 
@@ -54,13 +91,9 @@ tasks.register<Exec>("buildRustLibrary") {
     val androidHome = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
     environment("ANDROID_HOME", androidHome)
     environment("ANDROID_JAR", "$androidHome/platforms/android-36/android.jar")
-    // -Pmc.abi=<abi> builds a single ABI. A two-ABI Skia build is a long wait
-    // when the target device can only use one of them.
-    val abis = (project.findProperty("mc.abi") as String?)
-        ?.split(",")
-        ?.map(String::trim)
-        ?.filter { it.isNotEmpty() }
-        ?: listOf("arm64-v8a", "x86_64")
+    // A two-ABI Skia build is a long wait when the target device can only use
+    // one of them; see `mcAbis` above.
+    val abis = mcAbis
 
     commandLine(
         buildList {
